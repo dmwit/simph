@@ -1,5 +1,5 @@
 {-# LANGUAGE ConstraintKinds #-}
-module Limph where
+module Simph where
 
 import Control.Monad.Except
 import Control.Monad.RWS hiding ((<>))

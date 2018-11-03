@@ -1,4 +1,4 @@
-# Revision history for limph
+# Revision history for simph
 
 ## 0.1.0.0 -- YYYY-mm-dd
 
