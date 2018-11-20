@@ -1,4 +1,5 @@
 {-# LANGUAGE ConstraintKinds #-}
+{-# LANGUAGE DeriveFunctor #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 module Simph where
 
@@ -19,19 +20,38 @@ import qualified Data.IntSet as IS
 import qualified Data.Map as M
 import qualified Data.Set as S
 
-data SourceExpr = SourceVar String | SourceLambda String SourceExpr | SourceApp SourceExpr SourceExpr
+data SourceExpr
+	= SourceVar String
+	| SourceLambda (Purity Void) String SourceExpr
+	| SourceApp SourceExpr SourceExpr
+	| SourceCase SourceExpr [(Pattern, SourceExpr)]
+	| SourceAscription SourceExpr (MTy String String)
 	deriving (Eq, Ord, Read, Show)
+
+data Pattern = PatternVar String | PatternConstructor String [Pattern]
+	deriving (Eq, Ord, Read, Show)
+
+-- | Returns Left if it tries to bind a single variable twice.
+patBindings :: Pattern -> Either String (Set String)
+patBindings (PatternVar s) = Right (S.singleton s)
+patBindings (PatternConstructor _ pats) = mapM patBindings pats >>= disjointUnion where
+	disjointUnion [] = Right S.empty
+	disjointUnion (s:ss) = do
+		s' <- disjointUnion ss
+		if S.disjoint s s' then Right (S.union s s') else Left (S.elemAt 0 (S.intersection s s'))
 
 data TargetExpr pv
 	= TargetVar String
-	| TargetLambda String (Purity pv) (Purity pv) (TargetExpr pv)
-	| TargetApp (Purity pv) (Purity pv) (Purity pv) (Purity pv) (TargetExpr pv) (TargetExpr pv)
+	| TargetLambda String (TargetExpr pv)
+	| TargetApp (Purity pv) (Purity pv) (Purity pv) (Purity pv) (Purity pv) (TargetExpr pv) (TargetExpr pv)
+	| TargetCase (Purity pv) (TargetExpr pv) [(Pattern, TargetExpr pv)]
+	| TargetLift (Purity pv) (Purity pv) (TargetExpr pv)
 	deriving (Eq, Ord, Read, Show)
 
 data Purity pv = PurityVar pv | Pure | Monadic
-	deriving (Eq, Ord, Read, Show)
+	deriving (Eq, Ord, Read, Show, Functor)
 
-data BareTy pv tv = TyVar tv | Base | Arrow (BareTy pv tv) (MTy pv tv)
+data BareTy pv tv = TyVar tv | Base | Arrow (MTy pv tv) (MTy pv tv)
 	deriving (Eq, Ord, Read, Show)
 
 data MTy pv tv = MTy (Purity pv) (BareTy pv tv)
@@ -46,70 +66,92 @@ data Compilation pv tv = Compilation
 	, cType :: MTy pv tv
 	} deriving (Eq, Ord, Read, Show)
 
-instance Pretty SourceExpr where
-	pretty (SourceVar v) = pretty v
-	pretty e@(SourceLambda{}) = nest 4 (pretty "\\" <> sep (go e)) where
-		go (SourceLambda v body) = pretty v : go body
-		go body = [pretty "->", pretty body]
-	pretty (SourceApp e1 e2) = nest 4 $ sep [pretty1, pretty2] where
-		pretty1 = case e1 of
-			SourceLambda{} -> parens (pretty e1)
-			_ -> pretty e1
-		pretty2 = case e2 of
-			SourceVar{} -> pretty e2
-			_ -> parens (pretty e2)
+data Container = None | AppL | AppR deriving (Bounded, Enum, Eq, Ord, Read, Show)
 
-instance Pretty pv => Pretty (TargetExpr pv) where
-	pretty (TargetVar v) = pretty v
-	-- TODO: specialize the printing of TargetLambda and TargetApp when there
-	-- are no purity variables
-	pretty (TargetLambda v src tgt e) = nest 4 . sep
-		$  [pretty "\\" <> pretty v <> pretty " ->"]
-		++ case lift of
-			Nothing -> [pretty e]
-			Just liftDoc -> case e of
-				TargetVar{} -> [liftDoc, pretty e]
-				_ -> [liftDoc, parens (pretty e)]
+class PrettyPrec a where
+	prettyPrec :: Container -> a -> Doc ann
+
+parensIf False = id
+parensIf True  = parens
+
+instance Pretty SourceExpr where pretty = prettyPrec None
+instance PrettyPrec SourceExpr where
+	prettyPrec _ (SourceVar v) = pretty v
+	prettyPrec c (SourceLambda m v body)
+		= parensIf (c /= None)
+		. nest 4
+		$ pretty "\\" <> sep
+			[ hsep [pretty v, pretty $ if m == Pure then "->" else ">->"]
+			, pretty body
+			]
+	prettyPrec c (SourceApp e e')
+		= parensIf (c == AppR)
+		. nest 4
+		$ sep [prettyPrec AppL e, prettyPrec AppR e']
+	prettyPrec c (SourceCase scrutinee clauses)
+		= parensIf (c /= None)
+		. nest 4
+		. mconcat
+		. punctuate hardline
+		$ hsep [pretty "case", pretty scrutinee, pretty "of"]
+		: [ hsep [pretty pat, pretty "->", pretty e]
+		  | (pat, e) <- clauses
+		  ]
+	prettyPrec c (SourceAscription e mty)
+		= parensIf (c /= None)
+		. nest 4
+		$ sep [prettyPrec AppL e, pretty ":: " <> pretty mty]
+
+instance Pretty Pattern where pretty = prettyPrec None
+instance PrettyPrec Pattern where
+	prettyPrec _ (PatternVar v) = pretty v
+	prettyPrec _ (PatternConstructor constructor []) = pretty constructor
+	prettyPrec c (PatternConstructor constructor pats)
+		= parensIf (c == AppR)
+		$ hsep (pretty constructor : map (prettyPrec AppR) pats)
+
+instance (Eq pv, Pretty pv) => Pretty (TargetExpr pv) where pretty = prettyPrec None
+instance (Eq pv, Pretty pv) => PrettyPrec (TargetExpr pv) where
+	prettyPrec _ (TargetVar v) = pretty v
+	prettyPrec c (TargetLambda v body)
+		= parensIf (c /= None)
+		. nest 4
+		$ pretty "\\" <> sep [pretty v <> pretty " ->", pretty body]
+	prettyPrec c (TargetApp m marg mres m' mfullres e e') = parensIf (c == AppR) . nest 4 . sep $ case app of
+		Just doc -> [doc, prettyPrec AppR e, prettyPrec AppR e']
+		Nothing ->  [     prettyPrec AppL e, prettyPrec AppR e']
 		where
-		lift = case (src, tgt) of
-			(Pure, Pure) -> Nothing
-			(Monadic, Monadic) -> Nothing
-			(Pure, Monadic) -> Just $ pretty "pure"
-			_ -> Just . parens $ hsep
-				[ pretty "lift ::"
-				, pretty (MTy src voidBase)
-				, pretty "->"
-				, pretty (MTy tgt voidBase)
-				]
-	pretty (TargetApp m1 m2 m1res fullres e1 e2) = nest 4 . sep
-		$  case app of
-		   	Just appDoc -> [appDoc, parensUnlessVar e1]
-		   	Nothing -> case e1 of
-		   		TargetApp{} -> [pretty e1]
-		   		_ -> [parens (pretty e1)]
-		++ [parensUnlessVar e2]
-		where
-		app = case (m1, m1res, m2, fullres) of
-			(Pure   , Pure   , Pure   , Pure   ) -> Nothing
-			(Pure   , Pure   , Pure   , Monadic) -> Just (pretty "(pure.)")
-			(Pure   , Pure   , Monadic, Monadic) -> Just (pretty "fmap")
-			(Pure   , Monadic, Pure   , Monadic) -> Nothing
-			(Pure   , Monadic, Monadic, Monadic) -> Just (pretty "(=<<)")
-			(Monadic, Pure   , Pure   , Monadic) -> Just (pretty "(??)")
-			(Monadic, Pure   , Monadic, Monadic) -> Just (pretty "(<*>)")
-			(Monadic, Monadic, Pure   , Monadic) -> Just (pretty "(\\f x -> f >>= ($x))")
-			(Monadic, Monadic, Monadic, Monadic) -> Just (pretty "((join.) . liftA2 ($))")
-			_ -> Just . parens . hsep $
+		app = case (m, marg, mres, m', mfullres) of
+			(Pure, _, _, _, _) | marg == m' && mres == mfullres -> Nothing
+			(Monadic, _, Monadic, _, Monadic) | marg == m' -> Just $ pretty "(\\f x -> (f >>=) . ($x))"
+			(Monadic, Monadic, Monadic, Pure, Monadic) -> Just $ pretty "(\\f x -> f <&> ($return x))"
+			-- TODO: more special cases
+			_ -> Just . parens $ sep
 				[ pretty "app ::"
-				, parens (pretty (MTy m1 (Arrow Base (MTy m1res voidBase))))
-				, pretty "->"
-				, pretty (MTy m2 voidBase)
-				, pretty "->"
-				, pretty (MTy fullres voidBase)
+				, pretty (Arrow (MTy m (Arrow (MTy marg voidBase) (MTy mres voidBase))) (MTy Pure (Arrow (MTy m' voidBase) (MTy mfullres voidBase))))
 				]
-
-		parensUnlessVar e@TargetVar{} = pretty e
-		parensUnlessVar e = parens (pretty e)
+	-- TODO: use m, lol
+	prettyPrec c (TargetCase m scrutinee clauses)
+		= parensIf (c /= None)
+		. nest 4
+		. vsep
+		$ [ hsep [pretty "case", pretty scrutinee, pretty "of"]
+		  , braces . vsep . punctuate (pretty ";") $
+		  	[ nest 4 $ sep [pretty pat <> pretty " ->", pretty e]
+		  	| (pat, e) <- clauses
+		  	]
+		  ]
+	-- TODO: specialize for when there are no purity variables
+	prettyPrec c (TargetLift msrc mtgt e)
+		= parensIf (c == AppR)
+		. nest 4
+		. sep
+		$ [ parens $ sep
+		  	[ pretty "lift ::"
+		  	, pretty (Arrow (MTy msrc voidBase) (MTy mtgt voidBase))
+		  	]
+		  , prettyPrec AppR e
+		  ]
 
 voidBase :: BareTy pv Void
 voidBase = Base
@@ -119,23 +161,25 @@ instance Pretty pv => Pretty (Purity pv) where
 	pretty Monadic = pretty "m"
 	pretty (PurityVar pv) = pretty "ρ" <> pretty pv
 
-instance (Pretty pv, Pretty tv) => Pretty (BareTy pv tv) where
-	pretty (TyVar tv) = pretty "α" <> pretty tv
-	pretty Base = pretty "_"
-	pretty (Arrow i o) = nest 4 $ sep [prettyParenthesizeArrow i, pretty "-> " <> pretty o]
+instance (Pretty pv, Pretty tv) => Pretty (BareTy pv tv) where pretty = prettyPrec None
+instance (Pretty pv, Pretty tv) => PrettyPrec (BareTy pv tv) where
+	prettyPrec _ (TyVar tv) = pretty "α" <> pretty tv
+	prettyPrec _ Base = pretty "_"
+	prettyPrec c (Arrow i o)
+		= parensIf (c /= None)
+		. nest 4
+		$ sep [prettyPrec AppL i, pretty "-> " <> pretty o]
 
-instance (Pretty pv, Pretty tv) => Pretty (MTy pv tv) where
-	pretty (MTy Pure bty) = pretty bty
-	pretty (MTy m bty) = nest 4 $ sep [pretty m, prettyParenthesizeArrow bty]
-
-prettyParenthesizeArrow bty@Arrow{} = parens (pretty bty)
-prettyParenthesizeArrow bty = pretty bty
+instance (Pretty pv, Pretty tv) => Pretty (MTy pv tv) where pretty = prettyPrec None
+instance (Pretty pv, Pretty tv) => PrettyPrec (MTy pv tv) where
+	prettyPrec c (MTy Pure bty) = prettyPrec c bty
+	prettyPrec _ (MTy m bty) = nest 4 $ sep [pretty m, prettyPrec AppR bty]
 
 instance Pretty pv => Pretty (PurityConstraints pv) where
 	pretty (PurityConstraints cs) = braces . sep . punctuate comma
 		$  [hsep [pretty m, pretty "≤", pretty m'] | (m, m') <- cs]
 
-instance (Pretty pv, Pretty tv) => Pretty (Compilation pv tv) where
+instance (Eq pv, Pretty pv, Pretty tv) => Pretty (Compilation pv tv) where
 	pretty (Compilation eh ty) = sep
 		[ pretty eh
 		, hsep [pretty "::", pretty ty]
@@ -143,9 +187,9 @@ instance (Pretty pv, Pretty tv) => Pretty (Compilation pv tv) where
 
 simpleEnv :: Env pv tv
 simpleEnv = M.fromList
-	[ ("print", MTy Pure (Arrow Base (MTy Monadic Base)))
+	[ ("print", MTy Pure (Arrow (MTy Pure Base) (MTy Monadic Base)))
 	, ("readLn", MTy Monadic Base)
-	, ("plus", MTy Pure (Arrow Base (MTy Pure (Arrow Base (MTy Pure Base)))))
+	, ("plus", MTy Pure (Arrow (MTy Pure Base) (MTy Pure (Arrow (MTy Pure Base) (MTy Pure Base)))))
 	]
 
 data TCError pv tv
@@ -212,11 +256,7 @@ unifyCanonical :: Ctx pv tv => BareTy pv tv -> BareTy pv tv -> TC pv tv ()
 unifyCanonical (TyVar tv) ty = modify (\s -> s { bindings = M.insert tv ty (bindings s) })
 unifyCanonical ty (TyVar tv) = modify (\s -> s { bindings = M.insert tv ty (bindings s) })
 unifyCanonical Base Base = return ()
-unifyCanonical (Arrow i (MTy m o)) (Arrow i' (MTy m' o')) = do
-	m  ≤ m'
-	m' ≤ m
-	unify i i'
-	unify o o'
+unifyCanonical (Arrow i o) (Arrow i' o') = unifyM i i' >> unifyM o o'
 unifyCanonical ty ty' = throwError (TypeError ty ty')
 
 unify :: Ctx pv tv => BareTy pv tv -> BareTy pv tv -> TC pv tv ()
@@ -225,31 +265,91 @@ unify ty_ ty_' = do
 	ty' <- canonVar ty_'
 	unifyCanonical ty ty'
 
+unifyM :: Ctx pv tv => MTy pv tv -> MTy pv tv -> TC pv tv ()
+unifyM (MTy m ty) (MTy m' ty') = do
+	m  ≤ m'
+	m' ≤ m
+	unify ty ty'
+
+freshenUserMTy :: Ctx pv tv => MTy String String -> TC pv tv (MTy pv tv)
+freshenUserMTy mty = snd <$> goMTy M.empty M.empty mty where
+	goMTy pvs tvs (MTy m ty) = do
+		(pvs', m') <- goM pvs m
+		(res, ty') <- goBareTy pvs' tvs ty
+		return (res, MTy m' ty')
+
+	goM pvs m = case m of
+		PurityVar pv -> do
+			ρ <- maybe freshPV return $ M.lookup pv pvs
+			return (M.insert pv ρ pvs, ρ)
+		Pure -> return (pvs, Pure)
+		Monadic -> return (pvs, Monadic)
+
+	goBareTy pvs tvs ty = case ty of
+		TyVar tv -> do
+			α <- maybe freshTV return $ M.lookup tv tvs
+			return ((pvs, M.insert tv α tvs), α)
+		Base -> return ((pvs, tvs), Base)
+		Arrow i o -> do
+			((pvs' , tvs' ), i') <- goMTy pvs  tvs  i
+			((pvs'', tvs''), o') <- goMTy pvs' tvs' o
+			return ((pvs'', tvs''), Arrow i' o')
+
 infer :: Ctx pv tv => SourceExpr -> TC pv tv (Compilation pv tv)
 infer (SourceVar v) = asks (M.lookup v) >>= \mty -> case mty of
 	Nothing -> throwError (NotInScope v)
 	Just ty -> return (Compilation (TargetVar v) ty)
 
-infer (SourceLambda v e) = do
+infer (SourceLambda m_ v e) = do
 	mty <- asks (M.lookup v)
 	when (isJust mty) (throwError (AlreadyInScope v))
 	α <- freshTV
-	Compilation eh (MTy m ty) <- local (M.insert v (MTy Pure α)) (infer e)
+	Compilation eh (MTy m' ty) <- local (M.insert v (MTy m α)) (infer e)
 	ρ <- freshPV
-	ρ ≤ m
-	return (Compilation (TargetLambda v m ρ eh) (MTy Pure (Arrow α (MTy ρ ty))))
+	m' ≤ ρ
+	return (Compilation (TargetLambda v (TargetLift m' ρ eh)) (MTy Pure (Arrow (MTy m α) (MTy ρ ty))))
+	where m = absurd <$> m_
 
 infer (SourceApp e e') = do
 	Compilation eh  (MTy m  ty ) <- infer e
 	Compilation eh' (MTy m' ty') <- infer e'
+	ρ   <- freshPV
+	ρ'  <- freshPV
+	ρ'' <- freshPV
+	α   <- freshTV
+	unify ty (Arrow (MTy ρ ty') (MTy ρ' α))
+	ρ  ≤ ρ''
+	ρ' ≤ ρ''
+	m  ≤ ρ''
+	m' ≤ ρ''
+	return (Compilation (TargetApp m ρ ρ' m' ρ'' eh eh') (MTy ρ'' α))
+
+infer (SourceCase scrutinee clauses) = do
+	Compilation eh (MTy m ty) <- infer scrutinee
+	unify ty Base
+	compilations <- forM clauses $ \(pat, e') -> case patBindings pat of
+		Left var -> throwError (AlreadyInScope var)
+		Right vars -> do
+			env <- ask
+			let env' = M.fromSet (const (MTy Pure Base)) vars
+			    sharedEnv = M.intersection env env'
+			if M.null sharedEnv
+				then local (M.union env') (infer e')
+				else throwError (AlreadyInScope (fst (M.elemAt 0 sharedEnv)))
 	ρ <- freshPV
 	α <- freshTV
-	unify ty (Arrow ty' (MTy ρ α))
-	ρ' <- freshPV
-	m  ≤ ρ'
-	m' ≤ ρ'
-	ρ  ≤ ρ'
-	return (Compilation (TargetApp m m' ρ ρ' eh eh') (MTy ρ' α))
+	m ≤ ρ
+	forM compilations $ \(Compilation _ (MTy m' ty')) -> do
+		m' ≤ ρ
+		unify ty' α
+	let clauses' = zipWith (\(pat, _) (Compilation eh' _) -> (pat, eh')) clauses compilations
+	return (Compilation (TargetCase m eh clauses') (MTy ρ α))
+
+infer (SourceAscription e userMTy) = do
+	Compilation eh mty <- infer e
+	mty' <- freshenUserMTy userMTy
+	unifyM mty mty'
+	return (Compilation eh mty')
 
 data PuritySubstitution = PuritySubstitution
 	{ psAmbiguous :: IntSet -- could produce more structure, I guess...
@@ -302,8 +402,10 @@ solvePurityConstraints (ρ_min, ρ_max) (PurityConstraints pc) = mconcat <$> map
 substExpr :: PuritySubstitution -> TargetExpr Int -> TargetExpr Void
 substExpr (PuritySubstitution { psUnambiguous = im }) = go where
 	go (TargetVar s) = TargetVar s
-	go (TargetLambda s m0 m1 e) = TargetLambda s (resolve m0) (resolve m1) (go e)
-	go (TargetApp m0 m1 m2 m3 e e') = TargetApp (resolve m0) (resolve m1) (resolve m2) (resolve m3) (go e) (go e')
+	go (TargetLambda s e) = TargetLambda s (go e)
+	go (TargetApp m0 m1 m2 m3 m4 e e') = TargetApp (resolve m0) (resolve m1) (resolve m2) (resolve m3) (resolve m4) (go e) (go e')
+	go (TargetCase m scrutinee clauses) = TargetCase (resolve m) (go scrutinee) [(pat, go e) | (pat, e) <- clauses]
+	go (TargetLift m m' e) = TargetLift (resolve m) (resolve m') (go e)
 
 	resolve Pure = Pure
 	resolve Monadic = Monadic
@@ -319,7 +421,7 @@ substMTy (PuritySubstitution { psUnambiguous = pvm }) tvm = goMTy where
 			Just ty' -> goBareTy ty'
 			_ -> TyVar tv
 		Base -> Base
-		Arrow i o -> Arrow (goBareTy i) (goMTy o)
+		Arrow i o -> Arrow (goMTy i) (goMTy o)
 
 	resolve Pure = Pure
 	resolve Monadic = Monadic
