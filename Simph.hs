@@ -123,12 +123,14 @@ instance (Eq pv, Pretty pv) => PrettyPrec (TargetExpr pv) where
 		where
 		app = case (m, marg, mres, m', mfullres) of
 			(Pure, _, _, _, _) | marg == m' && mres == mfullres -> Nothing
+			(Pure, Pure, Pure, Monadic, Monadic) -> Just $ pretty "fmap"
+			(Monadic, Pure, Pure, Monadic, Monadic) -> Just $ pretty "(<*>)"
 			(Monadic, _, Monadic, _, Monadic) | marg == m' -> Just $ pretty "(\\f x -> (f >>=) . ($x))"
 			(Monadic, Monadic, Monadic, Pure, Monadic) -> Just $ pretty "(\\f x -> f <&> ($return x))"
 			-- TODO: more special cases
 			_ -> Just . parens $ sep
 				[ pretty "app ::"
-				, pretty (Arrow (MTy m (Arrow (MTy marg voidBase) (MTy mres voidBase))) (MTy Pure (Arrow (MTy m' voidBase) (MTy mfullres voidBase))))
+				, pretty (Arrow (MTy m (Arrow (voidMBase marg) (voidMBase mres))) (MTy Pure (Arrow (voidMBase m') (voidMBase mfullres))))
 				]
 	-- TODO: use m, lol
 	prettyPrec c (TargetCase m scrutinee clauses)
@@ -155,6 +157,9 @@ instance (Eq pv, Pretty pv) => PrettyPrec (TargetExpr pv) where
 
 voidBase :: BareTy pv Void
 voidBase = Base
+
+voidMBase :: Purity pv -> MTy pv Void
+voidMBase m = MTy m voidBase
 
 instance Pretty pv => Pretty (Purity pv) where
 	pretty Pure = pretty "Id"
