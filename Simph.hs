@@ -161,7 +161,7 @@ instance (Eq pv, Pretty pv) => PrettyPrec (TargetExpr pv) where
 			(Monadic, Monadic, Pure, Pure, Monadic) -> Just $ pretty "appMMPPM"
 			_ -> Just . parens $ sep
 				[ pretty "app ::"
-				, pretty (Arrow (MTy m (Arrow (MTy marg voidBase) (MTy mres voidBase))) (MTy Pure (Arrow (MTy m' voidBase) (MTy mfullres voidBase))))
+				, pretty (Arrow (MTy m (Arrow (voidMBase marg) (voidMBase mres))) (MTy Pure (Arrow (voidMBase m') (voidMBase mfullres))))
 				]
 			where
 			argMatch = marg == m'
@@ -191,6 +191,9 @@ instance (Eq pv, Pretty pv) => PrettyPrec (TargetExpr pv) where
 
 voidBase :: BareTy pv Void
 voidBase = Base
+
+voidMBase :: Purity pv -> MTy pv Void
+voidMBase m = MTy m voidBase
 
 instance Pretty pv => Pretty (Purity pv) where
 	pretty Pure = pretty "Id"
