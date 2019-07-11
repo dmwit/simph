@@ -43,6 +43,10 @@ patBindings (PatternConstructor _ pats) = mapM patBindings pats >>= disjointUnio
 data TargetExpr pv
 	= TargetVar String
 	| TargetLambda String (TargetExpr pv)
+	-- | In @TargetApp p1 p2 p3 p4 p5 e1 e2@, we have something like:
+	-- * @e1 : p1 (p2 t -> p3 t')@
+	-- * @e2 : p4 t@
+	-- * @e1 e2 : p5 t'@
 	| TargetApp (Purity pv) (Purity pv) (Purity pv) (Purity pv) (Purity pv) (TargetExpr pv) (TargetExpr pv)
 	| TargetCase (Purity pv) (TargetExpr pv) [(Pattern, TargetExpr pv)]
 	| TargetLift (Purity pv) (Purity pv) (TargetExpr pv)
@@ -222,6 +226,7 @@ simpleEnv = M.fromList
 	[ ("print", MTy Pure (Arrow (MTy Pure Base) (MTy Monadic Base)))
 	, ("readLn", MTy Monadic Base)
 	, ("plus", MTy Pure (Arrow (MTy Pure Base) (MTy Pure (Arrow (MTy Pure Base) (MTy Pure Base)))))
+	, ("forkIO", MTy Pure (Arrow (MTy Monadic Base) (MTy Monadic Base)))
 	]
 
 data TCError pv tv
@@ -277,8 +282,7 @@ canon tv = do
 	mty <- gets (M.lookup tv . bindings)
 	case mty of
 		Nothing -> return (TyVar tv)
-		Just (TyVar tv') -> canon tv'
-		Just ty -> return ty
+		Just ty -> canonVar ty
 
 canonVar :: Ctx pv tv => BareTy pv tv -> TC pv tv (BareTy pv tv)
 canonVar (TyVar tv) = canon tv
