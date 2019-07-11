@@ -110,7 +110,28 @@ instance PrettyPrec Pattern where
 		= parensIf (c == AppR)
 		$ hsep (pretty constructor : map (prettyPrec AppR) pats)
 
-instance (Eq pv, Pretty pv) => Pretty (TargetExpr pv) where pretty = prettyPrec None
+targetPreamble :: Doc a
+targetPreamble = vcat [pretty "let" <+> indent 0 (vcat binds), pretty "in"] where
+	binds = tail
+		-- special cases:
+		-- appPabab f x = f x -- this call is omitted entirely
+		-- appPPMMM f x = x >>= f -- just use (>>=)
+		-- appPPPMM f x = fmap f x -- just use fmap
+		-- appMPPMM f x = f <*> x -- just use (<*>)
+		-- appPMaPa f x = f (pure x) -- (.pure) is readable enough
+		-- appPaPaM f x = pure (f x) -- (pure.) is readable enough
+		[ undefined
+		, pretty "appPMPPM f x = pure (f (pure x))"
+		, pretty "appMaMaM f x = f >>= ($x)"
+		, pretty "appMMMPM f x = f >>= ($pure x)"
+		, pretty "appMPMMM f x = f >>= (x>>=)"
+		, pretty "appMaPaM f x = fmap ($x) f"
+		, pretty "appMMPPM f x = fmap ($pure x) f"
+		]
+
+instance (Eq pv, Pretty pv) => Pretty (TargetExpr pv) where
+	pretty e = vcat [targetPreamble, prettyPrec None e]
+
 instance (Eq pv, Pretty pv) => PrettyPrec (TargetExpr pv) where
 	prettyPrec _ (TargetVar v) = pretty v
 	prettyPrec c (TargetLambda v body)
@@ -122,14 +143,25 @@ instance (Eq pv, Pretty pv) => PrettyPrec (TargetExpr pv) where
 		Nothing ->  [     prettyPrec AppL e, prettyPrec AppR e']
 		where
 		app = case (m, marg, mres, m', mfullres) of
-			(Pure, _, _, _, _) | marg == m' && mres == mfullres -> Nothing
-			(Monadic, _, Monadic, _, Monadic) | marg == m' -> Just $ pretty "(\\f x -> (f >>=) . ($x))"
-			(Monadic, Monadic, Monadic, Pure, Monadic) -> Just $ pretty "(\\f x -> f <&> ($return x))"
-			-- TODO: more special cases
+			(Pure, _, _, _, _) | argMatch && resMatch -> Nothing
+			(Pure, Monadic, _, Pure, _) | resMatch -> Just $ pretty "(.pure)"
+			(Pure, Pure, Monadic, Monadic, Monadic) -> Just $ pretty "(>>=)"
+			(Pure, _, Pure, _, Monadic) | argMatch -> Just $ pretty "(pure.)"
+			(Pure, Pure, Pure, Monadic, Monadic) -> Just $ pretty "fmap"
+			(Pure, Monadic, Pure, Pure, Monadic) -> Just $ pretty "appPMPPM"
+			(Monadic, _, Monadic, _, Monadic) | argMatch -> Just $ pretty "appMaMaM"
+			(Monadic, Monadic, Monadic, Pure, Monadic) -> Just $ pretty "appMMMPM"
+			(Monadic, Pure, Monadic, Monadic, Monadic) -> Just $ pretty "appMPMMM"
+			(Monadic, _, Pure, _, Monadic) | argMatch -> Just $ pretty "appMaPaM"
+			(Monadic, Pure, Pure, Monadic, Monadic) -> Just $ pretty "(<*>)"
+			(Monadic, Monadic, Pure, Pure, Monadic) -> Just $ pretty "appMMPPM"
 			_ -> Just . parens $ sep
 				[ pretty "app ::"
 				, pretty (Arrow (MTy m (Arrow (MTy marg voidBase) (MTy mres voidBase))) (MTy Pure (Arrow (MTy m' voidBase) (MTy mfullres voidBase))))
 				]
+			where
+			argMatch = marg == m'
+			resMatch = mres == mfullres
 	-- TODO: use m, lol
 	prettyPrec c (TargetCase m scrutinee clauses)
 		= parensIf (c /= None)
