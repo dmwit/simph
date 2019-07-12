@@ -177,17 +177,16 @@ instance (Eq pv, Pretty pv) => PrettyPrec (TargetExpr pv) where
 		  	| (pat, e) <- clauses
 		  	]
 		  ]
-	-- TODO: specialize for when there are no purity variables
-	prettyPrec c (TargetLift msrc mtgt e)
-		= parensIf (c == AppR)
-		. nest 4
-		. sep
-		$ [ parens $ sep
-		  	[ pretty "lift ::"
-		  	, pretty (Arrow (MTy msrc voidBase) (MTy mtgt voidBase))
-		  	]
-		  , prettyPrec AppR e
-		  ]
+	prettyPrec c (TargetLift msrc mtgt e) = case (msrc, mtgt) of
+		(Pure, Monadic) -> parensIf (c == AppR) . nest 4 . sep $ [pretty "pure", prettyPrec AppR e]
+		_ | msrc == mtgt -> prettyPrec c e
+		  | otherwise -> parensIf (c == AppR) . nest 4 $ sep
+			[ parens $ sep
+				[ pretty "lift ::"
+				, pretty (Arrow (MTy msrc voidBase) (MTy mtgt voidBase))
+				]
+			, prettyPrec AppR e
+			]
 
 voidBase :: BareTy pv Void
 voidBase = Base
